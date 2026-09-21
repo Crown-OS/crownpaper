@@ -1,0 +1,58 @@
+[package]
+name = "crownpaper"
+version = "0.2.0"
+edition = "2024"
+
+# The protocol schema only. Clients get the typed contract without the
+# daemon's graphics stack — see the `daemon` feature.
+[lib]
+name = "crownpaper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crownpaper"
+path = "src/main.rs"
+required-features = ["daemon"]
+
+[features]
+default = ["daemon"]
+# Everything that renders: the daemon subcommand and the CLI around it.
+daemon = [
+  "dep:crownshell",
+  "dep:crownos-config",
+  "dep:image",
+  "dep:bytemuck",
+  "dep:clap",
+  "dep:anyhow",
+  "dep:log",
+  "dep:env_logger",
+]
+
+[dependencies]
+crownshell = { path = "../crownshell", features = ["text"], optional = true }
+crownos-ipc = { path = "../crownos-ipc" }
+# Only for reading `appearance.ron` at startup; the xilem integration is
+# for settings UIs and would pull a whole toolkit into the daemon.
+crownos-config = { path = "../crownos-config", default-features = false, optional = true }
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+  "bmp",
+], optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
+log = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = true
+
+[profile.samply]
+inherits = "release"
+debug = true
