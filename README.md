@@ -1,26 +1,29 @@
-# crownpaper
+# Crownpaper
 
-GPU wallpaper daemon for the CrownOS Wayland desktop. Shows an image or video on every output and animates changes with a cross-blur transition.
+Crownpaper is a wallpaper daemon for the CrownOS and other Wayland based desktop.
+
+It currently supports:
 
 - Still wallpapers: JPEG, PNG, WebP, BMP
-- Video wallpapers with VA-API hardware decoding and zero-copy dmabuf presentation
+- Video wallpapers with VA-API hardware decoding
 
 ## Features
 
-- Cross-blur transition between wallpapers, rendered with wgpu (Vulkan)
-- Lean at rest: the GPU renderer is released shortly after a transition ends
-- Video decoding runs in a separate `crownpaper-video` process, so FFmpeg is loaded only while a video plays
+- Beautiful cross-blur transition between wallpapers powered by wgpu (Vulkan)
+- the GPU renderer is released shortly after a transition ends to save memory
 - Preloading support for instant wallpaper changes
-- Control over the CrownOS IPC bus; the `crownpaper` library crate exposes the typed client protocol
+- Video decoding runs in a separate `crownpaper-video` process, so FFmpeg is loaded only while a video plays
 
 ## Installation
+
+Will be available on AUR soon(Delayed because [AUR](https://aur.archlinux.org/register) registeration is down).
 
 ```sh
 cargo build --release
 install -Dm755 target/release/crownpaper target/release/crownpaper-video -t ~/.local/bin
 ```
 
-Both binaries must be installed side by side. To build only the protocol client without the graphics stack, depend on the crate with `default-features = false`.
+Both binaries must be installed side by side.
 
 ## Usage
 
@@ -32,11 +35,17 @@ crownpaper daemon [--image <path>] [--duration <seconds>]
 
 Without `--image` it uses `wallpaper` from `.config/crownos/appearance.ron`.
 
-Control a running daemon:
+```ron
+{
+    wallpaper: "/home/marvelxcodes/.backgrounds/wallpaper.jpg",
+}
+```
+
+Control from CLI:
 
 | Command                        | Description                                           |
 | ------------------------------ | ----------------------------------------------------- |
-| `crownpaper set <path> [-d s]` | Transition to an image or video                       |
+| `crownpaper set <path> [-d s]` | Change the wallpaper                                  |
 | `crownpaper preload <paths>…`  | Decode wallpapers into the cache for an instant `set` |
 | `crownpaper unload <paths>…`   | Drop preloaded wallpapers                             |
 | `crownpaper preload-renderer`  | Keep the GPU renderer warm                            |
@@ -48,7 +57,7 @@ Set `RUST_LOG` to change log verbosity.
 
 ## Dependencies
 
-- A Wayland compositor with `wlr-layer-shell`, `wp_viewporter` and `linux-dmabuf`
+- A Wayland compositor with `wlr-layer-shell`, `wp_viewporter` and `linux-dmabuf` like [Hyprland](https://hypr.land/), [Sway](https://swaywm.org/), [Niri](https://github.com/niri-wm/niri)
 - A Vulkan GPU driver
 - libturbojpeg (found through `pkg-config`)
 - FFmpeg libraries and VA-API drivers for video wallpapers
