@@ -7,6 +7,16 @@
 //!
 //! The daemon half of it (`Handler`, `dispatch`) costs nothing to a client
 //! that only calls, so both halves are exported together.
+//!
+//! With the `daemon` feature the library also carries the code the daemon
+//! shares with its `crownpaper-video` helper process.
+
+#[cfg(feature = "daemon")]
+pub mod shm;
+#[cfg(feature = "daemon")]
+pub mod util;
+#[cfg(feature = "daemon")]
+pub mod video_wire;
 
 crownos_ipc::protocol! {
     mod protocol: "crownpaper" {
@@ -20,6 +30,11 @@ crownos_ipc::protocol! {
         notify preload(paths: Vec<String>);
         /// Drop preloaded wallpapers from the cache.
         notify unload(paths: Vec<String>);
+        /// Bring the GPU renderer up and keep it warm, so the next `set`
+        /// animates without paying for device creation.
+        notify preload_renderer();
+        /// Let the renderer be released again once the screen is at rest.
+        notify unload_renderer();
         /// Round trip that proves the daemon is alive and has drained
         /// everything sent before it.
         fn ping();

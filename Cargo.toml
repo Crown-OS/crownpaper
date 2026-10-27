@@ -14,13 +14,34 @@ name = "crownpaper"
 path = "src/main.rs"
 required-features = ["daemon"]
 
+# Video decoding lives in its own process so FFmpeg and its dependency tree
+# are only loaded while a video wallpaper plays.
+[[bin]]
+name = "crownpaper-video"
+path = "src/bin/crownpaper-video/main.rs"
+required-features = ["daemon"]
+
 [features]
 default = ["daemon"]
 # Everything that renders: the daemon subcommand and the CLI around it.
 daemon = [
-  "dep:crownshell",
+  "dep:smithay-client-toolkit",
+  "dep:calloop",
+  "dep:calloop-wayland-source",
+  "dep:wayland-client",
+  "dep:wayland-backend",
+  "dep:wayland-protocols",
+  "dep:raw-window-handle",
+  "dep:wgpu",
+  "dep:pollster",
   "dep:crownos-config",
   "dep:image",
+  "dep:turbojpeg",
+  "dep:fast_image_resize",
+  "dep:ffmpeg-next",
+  "dep:rustix",
+  "dep:postcard",
+  "dep:libc",
   "dep:bytemuck",
   "dep:clap",
   "dep:anyhow",
@@ -29,23 +50,36 @@ daemon = [
 ]
 
 [dependencies]
-crownshell = { path = "../crownshell", features = ["text"], optional = true }
 crownos-ipc = { path = "../crownos-ipc" }
+serde = { version = "1.0.229", features = ["derive"] }
+# calloop must stay on crownos-ipc's 0.13, which pins SCTK to 0.19.
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"], optional = true }
+calloop = { version = "0.13", optional = true }
+calloop-wayland-source = { version = "0.3", optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", features = ["client_system"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "29", default-features = false, features = ["vulkan", "std", "parking_lot"], optional = true }
 # Only for reading `appearance.ron` at startup; the xilem integration is
 # for settings UIs and would pull a whole toolkit into the daemon.
 crownos-config = { path = "../crownos-config", default-features = false, optional = true }
-image = { version = "0.25", default-features = false, features = [
-  "jpeg",
-  "png",
-  "webp",
-  "bmp",
-], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "webp", "bmp"], optional = true }
+turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config"], optional = true }
+fast_image_resize = { version = "6", optional = true }
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "mm", "net", "event"], optional = true }
+postcard = { version = "1", default-features = false, features = ["use-std"], optional = true }
+libc = { version = "0.2", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 anyhow = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
-serde = { version = "1.0.229", features = ["derive"] }
+
+[build-dependencies]
+naga = { version = "29", features = ["wgsl-in", "spv-out"] }
 
 [profile.release]
 lto = "thin"

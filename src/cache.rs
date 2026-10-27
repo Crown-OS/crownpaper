@@ -1,112 +1,108 @@
-//! Path-keyed cache of uploaded wallpaper textures.
+//! Wallpapers pinned by `preload`.
 //!
-//! Two retention classes share one map: entries used implicitly by `set`
-//! ride an LRU list capped at [`IMPLICIT_CAPACITY`], while explicitly
-//! preloaded entries are *pinned* — exempt from the cap until `unload`
-//! releases them. Callers pass a `protected` predicate (the wallpapers
-//! currently on screen) that eviction always honors.
+//! Entries are screen-sized images in shared memory, independent of the GPU,
+//! so they survive the renderer being torn down. Nothing is cached
+//! implicitly: an entry lives from `preload` until `unload`, or — when it is
+//! unloaded while on screen — until it leaves the screen.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::texture::GpuImage;
-
-/// How many unpinned wallpapers stay resident for instant re-`set`.
-const IMPLICIT_CAPACITY: usize = 6;
+use crate::wallpaper::Wallpaper;
 
 #[derive(Default)]
-pub struct TextureCache {
+pub struct WallpaperCache {
     entries: HashMap<PathBuf, Entry>,
-    /// Recency order of the unpinned entries; the front is evicted first.
-    lru: VecDeque<PathBuf>,
 }
 
 struct Entry {
-    image: GpuImage,
+    wallpaper: Wallpaper,
     pinned: bool,
 }
 
-impl TextureCache {
-    /// Look up a resident texture, refreshing its recency.
-    pub fn get(&mut self, path: &Path) -> Option<GpuImage> {
-        let entry = self.entries.get(path)?;
-        let image = entry.image.clone();
-        if !entry.pinned {
-            self.touch(path);
-        }
-        Some(image)
+impl WallpaperCache {
+    pub fn get(&self, path: &Path) -> Option<Wallpaper> {
+        self.entries.get(path).map(|entry| entry.wallpaper.clone())
     }
 
-    /// Pin a path that is already resident. Returns false when absent.
+    pub fn has_pinned(&self) -> bool {
+        self.entries.values().any(|entry| entry.pinned)
+    }
+
+    /// Pins a path that is already resident. Returns false when absent.
     pub fn pin_resident(&mut self, path: &Path) -> bool {
-        let Some(entry) = self.entries.get_mut(path) else {
-            return false;
-        };
-        if !entry.pinned {
-            entry.pinned = true;
-            self.lru.retain(|p| p != path);
-        }
-        true
+        self.entries
+            .get_mut(path)
+            .map(|entry| entry.pinned = true)
+            .is_some()
     }
 
-    pub fn insert(
-        &mut self,
-        path: PathBuf,
-        image: GpuImage,
-        pinned: bool,
-        protected: impl Fn(&Path) -> bool,
-    ) {
-        if let Some(entry) = self.entries.get_mut(&path) {
-            entry.image = image;
-            if pinned && !entry.pinned {
-                entry.pinned = true;
-                self.lru.retain(|p| p != &path);
-            } else if !entry.pinned {
-                self.touch(&path);
-            }
-            return;
-        }
-        self.entries.insert(path.clone(), Entry { image, pinned });
-        if !pinned {
-            self.lru.push_back(path);
-            self.enforce_cap(&protected);
-        }
+    pub fn pin(&mut self, wallpaper: Wallpaper) {
+        let path = wallpaper.path.clone();
+        self.entries.insert(
+            path,
+            Entry {
+                wallpaper,
+                pinned: true,
+            },
+        );
     }
 
-    /// Release a preloaded entry. Entries still on screen are only demoted to
-    /// the implicit LRU so they age out once they leave the screen.
-    pub fn unload(&mut self, path: &Path, protected: impl Fn(&Path) -> bool) {
-        let Some(entry) = self.entries.get_mut(path) else {
-            return;
-        };
-        if protected(path) {
-            if entry.pinned {
+    /// Releases a preloaded entry; one still on screen lingers until
+    /// [`Self::prune`] sees it leave.
+    pub fn unload(&mut self, path: &Path, on_screen: impl Fn(&Path) -> bool) {
+        if on_screen(path) {
+            if let Some(entry) = self.entries.get_mut(path) {
                 entry.pinned = false;
-                self.lru.push_back(path.to_path_buf());
-                self.enforce_cap(&protected);
             }
-            return;
-        }
-        self.entries.remove(path);
-        self.lru.retain(|p| p != path);
-        log::debug!("unloaded {}", path.display());
-    }
-
-    fn touch(&mut self, path: &Path) {
-        if let Some(pos) = self.lru.iter().position(|p| p == path) {
-            let recent = self.lru.remove(pos).expect("position came from iter");
-            self.lru.push_back(recent);
+        } else if self.entries.remove(path).is_some() {
+            log::debug!("unloaded {}", path.display());
         }
     }
 
-    fn enforce_cap(&mut self, protected: &impl Fn(&Path) -> bool) {
-        while self.lru.len() > IMPLICIT_CAPACITY {
-            let Some(pos) = self.lru.iter().position(|p| !protected(p)) else {
-                return; // everything over cap is on screen; try again later
-            };
-            let victim = self.lru.remove(pos).expect("position came from iter");
-            self.entries.remove(&victim);
-            log::debug!("evicted {}", victim.display());
+    pub fn prune(&mut self, on_screen: impl Fn(&Path) -> bool) {
+        self.entries
+            .retain(|path, entry| entry.pinned || on_screen(path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crownpaper::shm::ShmImage;
+    use crownpaper::util::cover::Size;
+
+    use super::*;
+    use crate::decode::WallpaperKind;
+
+    fn wallpaper(path: &str) -> Wallpaper {
+        Wallpaper {
+            path: PathBuf::from(path),
+            kind: WallpaperKind::Video,
+            image: Arc::new(ShmImage::new(Size::new(1, 1)).expect("memfd")),
         }
+    }
+
+    #[test]
+    fn unloading_an_on_screen_entry_defers_until_it_leaves() {
+        let mut cache = WallpaperCache::default();
+        cache.pin(wallpaper("/a"));
+        cache.unload(Path::new("/a"), |_| true);
+        assert!(!cache.has_pinned());
+        cache.prune(|_| true);
+        assert!(cache.get(Path::new("/a")).is_some());
+        cache.prune(|_| false);
+        assert!(cache.get(Path::new("/a")).is_none());
+    }
+
+    #[test]
+    fn pinned_entries_survive_pruning() {
+        let mut cache = WallpaperCache::default();
+        cache.pin(wallpaper("/b"));
+        cache.prune(|_| false);
+        assert!(cache.get(Path::new("/b")).is_some());
+        assert!(cache.pin_resident(Path::new("/b")));
+        assert!(!cache.pin_resident(Path::new("/missing")));
     }
 }
