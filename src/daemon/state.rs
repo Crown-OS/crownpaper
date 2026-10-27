@@ -438,7 +438,12 @@ mod tests {
         state.renderer_failed = true;
         assert!(state.can_start());
         assert!(!state.start_pending(Instant::now()));
-        assert!(state.scene.current().is_some_and(|w| w.path == Path::new("/next")));
+        assert!(
+            state
+                .scene
+                .current()
+                .is_some_and(|w| w.path == Path::new("/next"))
+        );
         assert!(!state.renderer_wanted());
         assert_eq!(state.take_changed(), [PathBuf::from("/next")]);
     }

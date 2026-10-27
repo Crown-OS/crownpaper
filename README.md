@@ -57,3 +57,11 @@ Set `RUST_LOG` to change log verbosity.
 
 - Rust 2024 edition toolchain
 - Sibling CrownOS crates: `crownos-ipc` and `crownos-config`, expected at `../crownos-ipc` and `../crownos-config`
+
+## Stability
+
+From 1.0 the IPC protocol exposed by the `crownpaper` library crate follows semantic versioning.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
