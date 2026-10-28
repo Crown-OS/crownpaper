@@ -1,6 +1,6 @@
 [package]
 name = "crownpaper"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "GPU wallpaper daemon for the CrownOS Wayland desktop"
 license = "MIT"

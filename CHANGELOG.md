@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1] - 2026-10-28
+
+### Added
+
+- Arch package published on every release, built by CI for the CrownOS ISO.
+
 ## [1.0.0] - 2026-10-27
 
 First stable release. The IPC protocol exposed by the `crownpaper` library crate is stable from this version.
