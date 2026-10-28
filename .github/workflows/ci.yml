@@ -14,3 +14,5 @@ permissions:
 jobs:
   ci:
     uses: Crown-OS/.github/.github/workflows/rust.yml@main
+    with:
+      packages: ffmpeg
