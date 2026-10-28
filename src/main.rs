@@ -1,21 +1,21 @@
 //! crownpaper — the CrownOS GPU wallpaper daemon.
 //!
-//! `crownpaper daemon` renders a background layer surface on every output
-//! and animates wallpaper changes with a blur→focus transition. The other
-//! subcommands are thin clients for the daemon's `crownpaper` service on
-//! the CrownOS IPC bus.
+//! `crownpaper daemon` shows a still or video wallpaper on every output and
+//! animates changes with a blur→focus transition. The other subcommands are
+//! thin clients for the daemon's `crownpaper` service on the CrownOS IPC bus.
 
 mod cache;
 mod daemon;
 mod decode;
-mod render;
-mod surface;
-mod texture;
+mod gpu;
+mod video;
+mod wallpaper;
+mod wayland;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,7 +24,7 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 #[command(
     name = "crownpaper",
     version,
-    about = "GPU wallpaper daemon for Wayland"
+    about = "Image and video wallpaper daemon for Wayland"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,7 +42,7 @@ enum Cmd {
         #[arg(short, long, default_value_t = daemon::DEFAULT_TRANSITION_SECS)]
         duration: f32,
     },
-    /// Transition to a new wallpaper
+    /// Transition to a new wallpaper (image or video)
     Set {
         path: PathBuf,
         /// Transition duration in seconds
@@ -59,6 +59,10 @@ enum Cmd {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Keep the GPU renderer warm so the next `set` animates at once
+    PreloadRenderer,
+    /// Let the renderer be released once the screen is at rest
+    UnloadRenderer,
     /// Health-check the daemon
     Ping,
     /// Stop the daemon
@@ -67,9 +71,9 @@ enum Cmd {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
+        env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn"),
     )
+    .format_timestamp_millis()
     .init();
 
     match Cli::parse().cmd {
@@ -98,6 +102,20 @@ fn main() -> Result<()> {
             client.unload(paths)?;
             roundtrip(&mut client)?;
             println!("unloaded {count} wallpaper(s)");
+            Ok(())
+        }
+        Cmd::PreloadRenderer => {
+            let mut client = connect()?;
+            client.preload_renderer()?;
+            roundtrip(&mut client)?;
+            println!("renderer held warm");
+            Ok(())
+        }
+        Cmd::UnloadRenderer => {
+            let mut client = connect()?;
+            client.unload_renderer()?;
+            roundtrip(&mut client)?;
+            println!("renderer released");
             Ok(())
         }
         Cmd::Ping => {

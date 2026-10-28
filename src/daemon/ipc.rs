@@ -4,34 +4,38 @@
 //! daemon and every client are generated from one declaration.
 //!
 //! The listener and every accepted peer are registered as calloop sources
-//! over dup'd fds, because [`Server`] is single-owner and lives in an
-//! `Rc<RefCell<_>>` shared by all callbacks. Peer sources track the
-//! connection's poll interest (read always, write only while replies or
-//! events are still buffered) and reregister themselves when it changes.
+//! over dup'd fds; the single-owner [`Server`] lives in the [`Daemon`] that
+//! every callback receives. Peer sources track the connection's poll
+//! interest (read always, write only while replies or events are still
+//! buffered) and reregister themselves when it changes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use calloop::generic::Generic;
+use calloop::{EventSource, LoopHandle, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 use crownos_ipc::{PeerId, RemoteError, Server, ServiceBuilder};
-use crownshell::calloop::generic::Generic;
-use crownshell::calloop::{
-    self, EventSource, LoopHandle, Mode, Poll, PostAction, Readiness, Token, TokenFactory,
-};
-use crownshell::App;
 
+use super::Daemon;
 use super::state::State;
 use crate::decode;
 
 pub struct Ipc {
     server: Server,
-    handler: Handler,
 }
 
 impl Ipc {
+    pub fn bind() -> Result<Self> {
+        let server = ServiceBuilder::new(crownpaper::SERVICE)
+            .build()
+            .context("binding the crownpaper service socket")?;
+        Ok(Self { server })
+    }
+
     pub fn emit_changed(&mut self, path: &Path) {
         let event = crownpaper::Changed {
             path: path.display().to_string(),
@@ -42,49 +46,33 @@ impl Ipc {
     }
 }
 
-/// Bind the service socket and wire it into the event loop.
-pub fn register(
-    loop_handle: &LoopHandle<'static, App>,
-    state: Rc<RefCell<State>>,
-) -> Result<Rc<RefCell<Ipc>>> {
-    let server = ServiceBuilder::new(crownpaper::SERVICE)
-        .build()
-        .context("binding the crownpaper service socket")?;
-    let ipc = Rc::new(RefCell::new(Ipc {
-        server,
-        handler: Handler { state },
-    }));
-
+/// Wire the bound service socket into the event loop.
+pub fn register(ipc: &Ipc, loop_handle: &LoopHandle<'static, Daemon>) -> Result<()> {
     let listener_fd = ipc
-        .borrow()
         .server
         .as_fd()
         .try_clone_to_owned()
         .context("duplicating the listener fd")?;
     let handle = loop_handle.clone();
-    let ipc_for_listener = Rc::clone(&ipc);
     loop_handle
         .insert_source(
             Generic::new(listener_fd, calloop::Interest::READ, Mode::Level),
-            move |_, _, _| {
-                accept_pending(&handle, &ipc_for_listener);
+            move |_, _, daemon| {
+                accept_pending(&handle, daemon);
                 Ok(PostAction::Continue)
             },
         )
         .map_err(|e| anyhow!("registering the ipc listener source: {e}"))?;
-    Ok(ipc)
+    Ok(())
 }
 
-fn accept_pending(handle: &LoopHandle<'static, App>, ipc: &Rc<RefCell<Ipc>>) {
+fn accept_pending(handle: &LoopHandle<'static, Daemon>, daemon: &mut Daemon) {
     loop {
-        // Bind first: a `borrow_mut` in the match scrutinee would live for
-        // the whole match and collide with the borrows in `register_peer`.
-        let accepted = ipc.borrow_mut().server.accept();
-        match accepted {
+        match daemon.ipc.server.accept() {
             Ok(Some(peer)) => {
-                if let Err(e) = register_peer(handle, ipc, peer) {
+                if let Err(e) = register_peer(handle, &daemon.ipc, peer) {
                     log::warn!("failed to register ipc peer: {e:#}");
-                    ipc.borrow_mut().server.drop_peer(peer);
+                    daemon.ipc.server.drop_peer(peer);
                 }
             }
             Ok(None) => return,
@@ -96,24 +84,17 @@ fn accept_pending(handle: &LoopHandle<'static, App>, ipc: &Rc<RefCell<Ipc>>) {
     }
 }
 
-fn register_peer(
-    handle: &LoopHandle<'static, App>,
-    ipc: &Rc<RefCell<Ipc>>,
-    peer: PeerId,
-) -> Result<()> {
-    let fd = {
-        let ipc = ipc.borrow();
-        let fd = ipc
-            .server
-            .peer_fd(peer)
-            .context("peer vanished before registration")?;
-        fd.try_clone_to_owned().context("duplicating the peer fd")?
-    };
+fn register_peer(handle: &LoopHandle<'static, Daemon>, ipc: &Ipc, peer: PeerId) -> Result<()> {
+    let fd = ipc
+        .server
+        .peer_fd(peer)
+        .context("peer vanished before registration")?
+        .try_clone_to_owned()
+        .context("duplicating the peer fd")?;
     let (source, interest) = PeerSource::new(fd);
-    let ipc = Rc::clone(ipc);
     handle
-        .insert_source(source, move |readiness, (), _app| {
-            pump_peer(&ipc, peer, readiness, &interest)
+        .insert_source(source, move |readiness, (), daemon| {
+            pump_peer(daemon, peer, readiness, &interest)
         })
         .map_err(|e| anyhow!("registering an ipc peer source: {e}"))?;
     Ok(())
@@ -122,13 +103,13 @@ fn register_peer(
 /// Pump one ready peer: flush writes, read frames, dispatch requests.
 /// Returns `Remove` once the peer is gone so calloop drops its source.
 fn pump_peer(
-    ipc: &Rc<RefCell<Ipc>>,
+    daemon: &mut Daemon,
     peer: PeerId,
     readiness: Readiness,
     interest: &Cell<calloop::Interest>,
 ) -> PostAction {
-    let ipc = &mut *ipc.borrow_mut();
-    let (server, handler) = (&mut ipc.server, &mut ipc.handler);
+    let server = &mut daemon.ipc.server;
+    let handler = &mut Requests(&mut daemon.state);
 
     if readiness.writable && server.handle_writable(peer).is_err() {
         return PostAction::Remove;
@@ -153,36 +134,40 @@ fn pump_peer(
     PostAction::Continue
 }
 
-struct Handler {
-    state: Rc<RefCell<State>>,
-}
+struct Requests<'a>(&'a mut State);
 
-impl crownpaper::Handler for Handler {
+impl crownpaper::Handler for Requests<'_> {
     fn set(&mut self, path: String, duration: f32) -> Result<(), RemoteError> {
         let path = canonical(&path);
         // Acknowledge as soon as the request is validated and queued; the
         // decode and transition proceed asynchronously.
-        decode::probe(&path).map_err(|e| RemoteError::handler(format!("{e:#}")))?;
-        self.state.borrow_mut().request_set(path, duration);
+        let kind = decode::probe(&path).map_err(|e| RemoteError::handler(format!("{e:#}")))?;
+        self.0.request_set(path, kind, duration);
         Ok(())
     }
 
     fn preload(&mut self, paths: Vec<String>) {
-        let mut state = self.state.borrow_mut();
         for path in paths {
             let path = canonical(&path);
             match decode::probe(&path) {
-                Ok(()) => state.request_preload(path),
+                Ok(kind) => self.0.request_preload(path, kind),
                 Err(e) => log::warn!("skipping preload: {e:#}"),
             }
         }
     }
 
     fn unload(&mut self, paths: Vec<String>) {
-        let mut state = self.state.borrow_mut();
         for path in paths {
-            state.request_unload(&canonical(&path));
+            self.0.request_unload(&canonical(&path));
         }
+    }
+
+    fn preload_renderer(&mut self) {
+        self.0.hold_renderer(true);
+    }
+
+    fn unload_renderer(&mut self) {
+        self.0.hold_renderer(false);
     }
 
     fn ping(&mut self) -> Result<(), RemoteError> {
@@ -191,7 +176,7 @@ impl crownpaper::Handler for Handler {
 
     fn quit(&mut self) {
         log::info!("quit requested over ipc");
-        self.state.borrow_mut().request_quit();
+        self.0.request_quit();
     }
 }
 

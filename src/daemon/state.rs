@@ -1,149 +1,39 @@
-//! Shared daemon state.
-//!
-//! One [`State`] behind an `Rc<RefCell<_>>` connects the IPC handler, the
-//! decode-result channel and every per-output surface. Surfaces only *read*
-//! the scene (plus advance its clocks); all mutations funnel through the
-//! request methods here, which wake the event loop so `needs_redraw` gets
-//! polled and queued bus events get flushed.
+//! Daemon state: requests, decode results, the scene and the renderer's
+//! lifecycle. Everything here is plain data driven from the event loop; the
+//! Wayland side reconciles against it in [`super::Daemon::sync`].
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crownshell::calloop::channel::Sender;
-use crownshell::wgpu;
+use calloop::channel::Sender;
 
-use crate::cache::TextureCache;
-use crate::decode::{DecodedImage, Decoder, Priority};
-use crate::render::Gpu;
-use crate::texture::GpuImage;
+use super::scene::Scene;
+use crate::cache::WallpaperCache;
+use crate::decode::{DecodeResult, Decoded, Decoder, Job, Priority, WallpaperKind};
+use crate::gpu::Renderer;
+use crate::video::{ImportableFormats, Player, VideoHelper};
+use crate::wallpaper::Wallpaper;
+use crate::wayland::Content;
+use crownpaper::util::cover::Size;
+use crownpaper::util::memory::trim_heap;
 
-const INTRO_DURATION_SECS: f32 = 0.85;
-const INTRO_START_SCALE: f32 = 1.15;
-/// Resting zoom of the wallpaper. Slightly above 1.0 so the intro's settle
-/// curve never dips below full coverage and reveals letterbox.
-const INTRO_END_SCALE: f32 = 1.02;
-const MIN_TRANSITION_SECS: f32 = 0.05;
+/// How long an idle renderer lingers before it is torn down, so a burst of
+/// `set`s does not rebuild the device for every one.
+const RENDERER_GRACE: Duration = Duration::from_secs(2);
 
-/// A wallpaper layer bound to the shader: source path plus uploaded texture.
-#[derive(Clone)]
-pub struct WallpaperLayer {
-    pub path: PathBuf,
-    pub image: GpuImage,
-}
-
-struct Transition {
-    started: Instant,
-    duration: f32,
-}
-
-/// Per-frame animation parameters, identical for every output so multi-head
-/// transitions stay in sync.
-pub struct FrameParams {
-    pub progress: f32,
-    pub intro_scale: f32,
-    pub time: f32,
-}
-
-/// What is on screen: the incoming (`to`) and, mid-transition, outgoing
-/// (`from`) wallpaper, plus the animation clocks they share.
-pub struct Scene {
-    pub from: Option<WallpaperLayer>,
-    pub to: Option<WallpaperLayer>,
-    transition: Option<Transition>,
-    intro_started: Option<Instant>,
-    /// Bumped whenever `from`/`to` change; surfaces rebuild their bind group
-    /// when their recorded generation no longer matches.
-    pub generation: u64,
-    epoch: Instant,
-}
-
-impl Scene {
-    fn new() -> Self {
-        Self {
-            from: None,
-            to: None,
-            transition: None,
-            intro_started: None,
-            generation: 0,
-            epoch: Instant::now(),
-        }
-    }
-
-    /// First wallpaper: no crossfade, just the launch intro zoom.
-    fn set_initial(&mut self, to: WallpaperLayer) {
-        self.to = Some(to);
-        self.intro_started = Some(Instant::now());
-        self.generation += 1;
-    }
-
-    fn begin_transition(&mut self, to: WallpaperLayer, duration: f32) {
-        self.from = self.to.take();
-        self.to = Some(to);
-        self.transition = Some(Transition {
-            started: Instant::now(),
-            duration: duration.max(MIN_TRANSITION_SECS),
-        });
-        self.intro_started = None;
-        self.generation += 1;
-    }
-
-    /// Whether `path` is on screen right now and must survive cache eviction.
-    pub fn uses(&self, path: &Path) -> bool {
-        let matches =
-            |layer: &Option<WallpaperLayer>| layer.as_ref().is_some_and(|l| l.path == path);
-        matches(&self.from) || matches(&self.to)
-    }
-
-    pub fn is_animating(&self) -> bool {
-        self.transition.is_some() || self.intro_started.is_some()
-    }
-
-    /// Advance the animation clocks and return this frame's parameters.
-    ///
-    /// Finished animations are retired here: the final frame renders with
-    /// `progress == 1.0`, and the outgoing layer is dropped in the same step
-    /// so its texture can be reclaimed (the shader skips the fully faded
-    /// layer, so the swapped-in placeholder is never sampled visibly).
-    pub fn frame(&mut self) -> FrameParams {
-        let progress = match &self.transition {
-            Some(t) => {
-                let p = t.started.elapsed().as_secs_f32() / t.duration;
-                if p >= 1.0 {
-                    self.transition = None;
-                    self.from = None;
-                    self.generation += 1;
-                    1.0
-                } else {
-                    p
-                }
-            }
-            None => 1.0,
-        };
-        let intro_scale = match self.intro_started {
-            Some(started) => {
-                let p = started.elapsed().as_secs_f32() / INTRO_DURATION_SECS;
-                if p >= 1.0 {
-                    self.intro_started = None;
-                    INTRO_END_SCALE
-                } else {
-                    INTRO_START_SCALE + (INTRO_END_SCALE - INTRO_START_SCALE) * intro_ease(p)
-                }
-            }
-            None => INTRO_END_SCALE,
-        };
-        FrameParams {
-            progress,
-            intro_scale,
-            time: self.epoch.elapsed().as_secs_f32(),
-        }
-    }
+pub enum RendererSlot {
+    Cold,
+    Building,
+    Warm(Renderer),
 }
 
 /// What to do with a path once its decode completes.
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct LoadIntent {
+    kind: WallpaperKind,
     /// Transition duration, when the wallpaper should be shown on arrival.
     display: Option<f32>,
     /// Keep it pinned in the cache (preload).
@@ -151,73 +41,85 @@ struct LoadIntent {
 }
 
 pub struct State {
-    pub gpu: Option<Gpu>,
-    pub cache: TextureCache,
     pub scene: Scene,
-    decoder: Decoder,
-    /// Paths currently in the decode queue and what they were requested for.
+    pub renderer: RendererSlot,
+    pub playback: Option<Player>,
+    pub quit: bool,
+    /// Largest output in physical pixels; the decode target.
+    pub screen: Size,
+    pub video_device: Option<PathBuf>,
+    pub importable: ImportableFormats,
+    cache: WallpaperCache,
+    /// Started on first use, so no thread exists before startup is done.
+    decoder: Option<Decoder>,
+    decoded: Sender<DecodeResult>,
+    renderer_ready: Sender<Result<Renderer, String>>,
+    renderer_held: bool,
+    renderer_failed: bool,
+    idle_since: Option<Instant>,
+    /// Paths in the decode queue and what they were requested for.
     in_flight: HashMap<PathBuf, LoadIntent>,
-    /// Decodes that finished before the first surface brought the GPU up.
-    awaiting_gpu: Vec<(PathBuf, DecodedImage, LoadIntent)>,
+    /// Decoded and waiting for the renderer before its transition can start.
+    pending_display: Option<(Wallpaper, f32)>,
+    /// An opened video waiting for its transition to finish.
+    pending_source: Option<(PathBuf, VideoHelper)>,
     /// `Changed` events not yet emitted on the bus.
     changed: Vec<PathBuf>,
-    pub quit: bool,
-    /// Bumped whenever surfaces should repaint outside an animation frame.
-    pub paint_serial: u64,
-    /// Wakes the daemon's flush source so events and redraws happen promptly.
-    wake: Sender<()>,
 }
 
 impl State {
-    pub fn new(decoder: Decoder, wake: Sender<()>) -> Self {
+    pub fn new(
+        decoded: Sender<DecodeResult>,
+        renderer_ready: Sender<Result<Renderer, String>>,
+    ) -> Self {
         Self {
-            gpu: None,
-            cache: TextureCache::default(),
-            scene: Scene::new(),
-            decoder,
-            in_flight: HashMap::new(),
-            awaiting_gpu: Vec::new(),
-            changed: Vec::new(),
+            scene: Scene::default(),
+            renderer: RendererSlot::Cold,
+            playback: None,
             quit: false,
-            paint_serial: 0,
-            wake,
+            screen: Size::new(1920, 1080),
+            video_device: None,
+            importable: Arc::new([]),
+            cache: WallpaperCache::default(),
+            decoder: None,
+            decoded,
+            renderer_ready,
+            renderer_held: false,
+            renderer_failed: false,
+            idle_since: None,
+            in_flight: HashMap::new(),
+            pending_display: None,
+            pending_source: None,
+            changed: Vec::new(),
         }
     }
 
-    /// Adopt the shared device/queue on first surface setup and flush any
-    /// decodes that were waiting for a GPU.
-    pub fn ensure_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.gpu.is_some() {
-            return;
-        }
-        self.gpu = Some(Gpu::new(device.clone(), queue.clone()));
-        for (path, image, intent) in std::mem::take(&mut self.awaiting_gpu) {
-            self.finish_load(path, &image, intent);
-        }
-    }
-
-    /// `set`: show `path`, transitioning over `duration` seconds. Cache hits
-    /// start immediately; misses decode off-thread first.
-    pub fn request_set(&mut self, path: PathBuf, duration: f32) {
-        self.cancel_superseded_displays(&path);
-        if let Some(image) = self.cache.get(&path) {
-            self.display(WallpaperLayer { path, image }, duration);
-            return;
+    /// `set`: show `path`, transitioning over `duration` seconds.
+    pub fn request_set(&mut self, path: PathBuf, kind: WallpaperKind, duration: f32) {
+        self.renderer_failed = false;
+        self.cancel_superseded(&path);
+        if let Some(wallpaper) = self.resident(&path) {
+            let needs_source = wallpaper.is_video() && !self.is_playing(&path);
+            self.display(wallpaper, duration);
+            if !needs_source {
+                return;
+            }
         }
         match self.in_flight.entry(path.clone()) {
             Entry::Occupied(mut e) => e.get_mut().display = Some(duration),
             Entry::Vacant(e) => {
                 e.insert(LoadIntent {
+                    kind,
                     display: Some(duration),
                     pin: false,
                 });
-                self.decoder.enqueue(path, Priority::Display);
+                self.enqueue(path, kind, Priority::Display);
             }
         }
     }
 
     /// `preload`: decode and pin without displaying.
-    pub fn request_preload(&mut self, path: PathBuf) {
+    pub fn request_preload(&mut self, path: PathBuf, kind: WallpaperKind) {
         if self.cache.pin_resident(&path) {
             return;
         }
@@ -225,10 +127,11 @@ impl State {
             Entry::Occupied(mut e) => e.get_mut().pin = true,
             Entry::Vacant(e) => {
                 e.insert(LoadIntent {
+                    kind,
                     display: None,
                     pin: true,
                 });
-                self.decoder.enqueue(path, Priority::Preload);
+                self.enqueue(path, kind, Priority::Preload);
             }
         }
     }
@@ -242,45 +145,162 @@ impl State {
         self.cache.unload(path, |p| scene.uses(p));
     }
 
+    /// `preload_renderer` / `unload_renderer`: keep the GPU warm without
+    /// naming a wallpaper.
+    pub fn hold_renderer(&mut self, held: bool) {
+        self.renderer_held = held;
+    }
+
     pub fn request_quit(&mut self) {
         self.quit = true;
-        self.wake();
     }
 
-    pub fn on_decoded(&mut self, path: PathBuf, result: Result<DecodedImage, String>) {
-        let Some(intent) = self.in_flight.remove(&path) else {
+    pub fn on_decoded(&mut self, decoded: DecodeResult) {
+        let Some(intent) = self.in_flight.remove(&decoded.path) else {
             return;
         };
-        match result {
-            Ok(image) => {
-                if intent.display.is_none() && !intent.pin {
-                    return; // unloaded while decoding
-                }
-                if self.gpu.is_some() {
-                    self.finish_load(path, &image, intent);
-                } else {
-                    self.awaiting_gpu.push((path, image, intent));
-                }
+        let (image, source) = match decoded.result {
+            Ok(Decoded::Still(image)) => (image, None),
+            Ok(Decoded::Video(opened)) => (opened.poster, Some(opened.helper)),
+            Err(e) => {
+                log::warn!("wallpaper load failed: {e}");
+                return;
             }
-            Err(e) => log::warn!("wallpaper load failed: {e}"),
+        };
+        if intent.display.is_none() && !intent.pin {
+            return; // unloaded while decoding
+        }
+        let wallpaper = self.cache.get(&decoded.path).unwrap_or_else(|| Wallpaper {
+            path: decoded.path.clone(),
+            kind: intent.kind,
+            image: Arc::new(image),
+        });
+        if intent.pin {
+            self.cache.pin(wallpaper.clone());
+        }
+        if let Some(duration) = intent.display {
+            if let Some(source) = source {
+                self.pending_source = Some((decoded.path, source));
+            }
+            self.display(wallpaper, duration);
         }
     }
 
-    /// Only the latest `set` may win: a newer request voids the display
-    /// intent of any earlier one still in the decode pipeline, so a slow
-    /// decode can never overwrite a wallpaper chosen after it.
-    fn cancel_superseded_displays(&mut self, winner: &Path) {
-        for (path, intent) in &mut self.in_flight {
-            if path != winner {
-                intent.display = None;
+    pub fn on_renderer(&mut self, built: Result<Renderer, String>) {
+        match built {
+            Ok(renderer) => self.renderer = RendererSlot::Warm(renderer),
+            Err(e) => {
+                log::error!("renderer unavailable, wallpapers change without animation: {e}");
+                self.renderer = RendererSlot::Cold;
+                self.renderer_failed = true;
             }
         }
-        self.awaiting_gpu.retain_mut(|(path, _, intent)| {
-            if path != winner {
-                intent.display = None;
+    }
+
+    /// Starts the queued transition once the renderer is up (or shows it
+    /// outright when there is no GPU). Returns whether an animation began.
+    pub fn start_pending(&mut self, now: Instant) -> bool {
+        if !self.can_start() {
+            return false;
+        }
+        let Some((wallpaper, duration)) = self.pending_display.take() else {
+            return false;
+        };
+        if let Some(mut player) = self.playback.take() {
+            match player.snapshot() {
+                Ok(Some(still)) => self.scene.replace_current_image(Arc::new(still)),
+                Ok(None) => {}
+                Err(e) => log::warn!("snapshotting the video: {e:#}"),
             }
-            intent.display.is_some() || intent.pin
-        });
+        }
+        match &self.renderer {
+            RendererSlot::Warm(renderer) => {
+                self.scene.begin(wallpaper, duration, now);
+                self.scene.upload(renderer);
+                true
+            }
+            _ => {
+                self.scene.show_instantly(wallpaper);
+                false
+            }
+        }
+    }
+
+    pub fn can_start(&self) -> bool {
+        self.pending_display.is_some()
+            && (self.renderer_failed || matches!(self.renderer, RendererSlot::Warm(_)))
+    }
+
+    /// Once the screen is at rest, frees what left it and starts a video.
+    pub fn settle(&mut self) {
+        if self.scene.is_animating() || self.pending_display.is_some() {
+            return;
+        }
+        let scene = &self.scene;
+        self.cache.prune(|path| scene.uses(path));
+        if self.playback.is_some() {
+            return;
+        }
+        let Some(current) = self.scene.current().filter(|w| w.is_video()) else {
+            return;
+        };
+        if self
+            .pending_source
+            .as_ref()
+            .is_none_or(|(path, _)| *path != current.path)
+        {
+            return;
+        }
+        if let Some((_, helper)) = self.pending_source.take() {
+            self.playback = Some(Player::new(helper));
+        }
+    }
+
+    /// What the layer surfaces show while nothing animates.
+    pub fn rest_content(&self) -> Option<Content> {
+        if let Some(frame) = self.playback.as_ref().and_then(Player::current) {
+            return Some(Content::Video(Arc::clone(frame)));
+        }
+        self.scene
+            .current()
+            .map(|wallpaper| Content::Image(Arc::clone(&wallpaper.image)))
+    }
+
+    /// Brings the renderer up when something needs it and reports when an
+    /// idle one should be torn down.
+    #[must_use]
+    pub fn drive_renderer(&mut self, now: Instant) -> bool {
+        let wanted = self.renderer_wanted();
+        if wanted {
+            self.idle_since = None;
+        }
+        match self.renderer {
+            RendererSlot::Cold if wanted && !self.renderer_failed => {
+                match Renderer::spawn_build(self.renderer_ready.clone()) {
+                    Ok(()) => self.renderer = RendererSlot::Building,
+                    Err(e) => self.on_renderer(Err(format!("{e:#}"))),
+                }
+                false
+            }
+            RendererSlot::Warm(_) if !wanted => {
+                now >= *self.idle_since.get_or_insert(now) + RENDERER_GRACE
+            }
+            _ => false,
+        }
+    }
+
+    pub fn tear_down_renderer(&mut self) {
+        self.scene.release_textures();
+        self.renderer = RendererSlot::Cold;
+        self.idle_since = None;
+        trim_heap();
+        log::info!("renderer released");
+    }
+
+    /// When the loop must wake on its own to retire an idle renderer.
+    pub fn next_deadline(&self, now: Instant) -> Option<Duration> {
+        self.idle_since
+            .map(|since| (since + RENDERER_GRACE).saturating_duration_since(now))
     }
 
     /// Drain the `Changed` events queued since the last flush.
@@ -288,66 +308,143 @@ impl State {
         std::mem::take(&mut self.changed)
     }
 
-    fn finish_load(&mut self, path: PathBuf, decoded: &DecodedImage, intent: LoadIntent) {
-        let gpu = self.gpu.as_ref().expect("finish_load requires a GPU");
-        let image = GpuImage::upload(&gpu.device, &gpu.queue, decoded);
-        let scene = &self.scene;
+    fn renderer_wanted(&self) -> bool {
+        self.scene.is_animating()
+            || self.pending_display.is_some()
+            || self.renderer_held
+            || self.cache.has_pinned()
+            || self
+                .in_flight
+                .values()
+                .any(|intent| intent.display.is_some())
+    }
+
+    /// A decoded copy of `path` already in memory: pinned, or on screen.
+    fn resident(&self, path: &Path) -> Option<Wallpaper> {
         self.cache
-            .insert(path.clone(), image.clone(), intent.pin, |p| scene.uses(p));
-        if let Some(duration) = intent.display {
-            self.display(WallpaperLayer { path, image }, duration);
+            .get(path)
+            .or_else(|| self.scene.current().filter(|w| w.path == path).cloned())
+    }
+
+    fn is_playing(&self, path: &Path) -> bool {
+        (self.playback.is_some() && self.scene.current().is_some_and(|w| w.path == path))
+            || self.pending_source.as_ref().is_some_and(|(p, _)| p == path)
+    }
+
+    fn enqueue(&mut self, path: PathBuf, kind: WallpaperKind, priority: Priority) {
+        if self.decoder.is_none() {
+            match Decoder::spawn(self.decoded.clone()) {
+                Ok(decoder) => self.decoder = Some(decoder),
+                Err(e) => {
+                    log::error!("{e:#}");
+                    return;
+                }
+            }
+        }
+        let job = Job {
+            path,
+            kind,
+            screen: self.screen,
+            video_device: self.video_device.clone(),
+            importable: Arc::clone(&self.importable),
+        };
+        if let Some(decoder) = &self.decoder {
+            decoder.enqueue(job, priority);
         }
     }
 
-    fn display(&mut self, layer: WallpaperLayer, duration: f32) {
-        let already_shown = self.scene.to.as_ref().is_some_and(|l| l.path == layer.path);
-        if !already_shown {
-            if self.scene.to.is_none() {
-                self.scene.set_initial(layer.clone());
-            } else {
-                self.scene.begin_transition(layer.clone(), duration);
+    /// Only the latest `set` may win: a newer request voids the display intent
+    /// of any earlier one still in the pipeline, so a slow decode can never
+    /// overwrite a wallpaper chosen after it.
+    fn cancel_superseded(&mut self, winner: &Path) {
+        for (path, intent) in &mut self.in_flight {
+            if path != winner {
+                intent.display = None;
             }
-            log::info!("wallpaper changed to {}", layer.path.display());
+        }
+        if self
+            .pending_display
+            .as_ref()
+            .is_some_and(|(w, _)| w.path != winner)
+        {
+            self.pending_display = None;
+        }
+        if self
+            .pending_source
+            .as_ref()
+            .is_some_and(|(path, _)| path != winner)
+        {
+            self.pending_source = None;
+        }
+    }
+
+    fn display(&mut self, wallpaper: Wallpaper, duration: f32) {
+        let already_shown = self.pending_display.is_none()
+            && self
+                .scene
+                .current()
+                .is_some_and(|w| w.path == wallpaper.path);
+        if !already_shown {
+            log::info!("wallpaper changing to {}", wallpaper.path.display());
+            self.changed.push(wallpaper.path.clone());
+            self.pending_display = Some((wallpaper, duration));
+            return;
         }
         // Emitted even when redundant: subscribers mirror it into config.
-        self.changed.push(layer.path);
-        self.request_repaint();
-    }
-
-    fn request_repaint(&mut self) {
-        self.paint_serial += 1;
-        self.wake();
-    }
-
-    fn wake(&self) {
-        if self.wake.send(()).is_err() {
-            log::error!("daemon wake channel closed");
-        }
+        self.changed.push(wallpaper.path);
     }
 }
 
-/// CPU-side easing for the intro zoom, matching the old launch feel:
-/// CSS `cubic-bezier(0.62, 0.0, 0.49, 0.99)` evaluated by inverting
-/// `B_x(t) = x` with Newton-Raphson and returning `B_y(t)`.
-fn intro_ease(x: f32) -> f32 {
-    const X1: f32 = 0.62;
-    const Y1: f32 = 0.0;
-    const X2: f32 = 0.49;
-    const Y2: f32 = 0.99;
-    let (ax, bx, cx) = (3.0 * X1, 3.0 * X2 - 6.0 * X1, 3.0 * X1 - 3.0 * X2 + 1.0);
-    let (ay, by, cy) = (3.0 * Y1, 3.0 * Y2 - 6.0 * Y1, 3.0 * Y1 - 3.0 * Y2 + 1.0);
+#[cfg(test)]
+mod tests {
+    use crownpaper::shm::ShmImage;
 
-    let x = x.clamp(0.0, 1.0);
-    let mut t = x;
-    for _ in 0..8 {
-        let bezier_x = t * (ax + t * (bx + t * cx));
-        let derivative = (ax + t * (2.0 * bx + 3.0 * cx * t)).max(1e-6);
-        let delta = (bezier_x - x) / derivative;
-        t -= delta;
-        if delta.abs() < 1e-6 {
-            break;
+    use super::*;
+
+    fn state() -> State {
+        let (decoded, _) = calloop::channel::channel();
+        let (renderer_ready, _) = calloop::channel::channel();
+        State::new(decoded, renderer_ready)
+    }
+
+    fn still(path: &str) -> Wallpaper {
+        Wallpaper {
+            path: PathBuf::from(path),
+            kind: WallpaperKind::Video,
+            image: Arc::new(ShmImage::new(Size::new(1, 1)).expect("memfd")),
         }
     }
-    t = t.clamp(0.0, 1.0);
-    t * (ay + t * (by + t * cy))
+
+    #[test]
+    fn renderer_is_wanted_only_while_needed() {
+        let mut state = state();
+        assert!(!state.renderer_wanted());
+        state.hold_renderer(true);
+        assert!(state.renderer_wanted());
+        state.hold_renderer(false);
+        assert!(!state.renderer_wanted());
+        state.cache.pin(still("/preloaded"));
+        assert!(state.renderer_wanted());
+        state.request_unload(Path::new("/preloaded"));
+        assert!(!state.renderer_wanted());
+    }
+
+    #[test]
+    fn a_ready_wallpaper_waits_for_the_renderer() {
+        let mut state = state();
+        state.display(still("/next"), 1.0);
+        assert!(state.renderer_wanted());
+        assert!(!state.can_start());
+        state.renderer_failed = true;
+        assert!(state.can_start());
+        assert!(!state.start_pending(Instant::now()));
+        assert!(
+            state
+                .scene
+                .current()
+                .is_some_and(|w| w.path == Path::new("/next"))
+        );
+        assert!(!state.renderer_wanted());
+        assert_eq!(state.take_changed(), [PathBuf::from("/next")]);
+    }
 }
