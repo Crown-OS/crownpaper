@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0] - 2026-10-31
+
+### Changed
+
+- `crownpaper` without a subcommand starts the daemon and accepts `--image` / `--duration` directly. `crownpaper daemon` still works.
+
 ## [1.0.1] - 2026-10-28
 
 ### Added
