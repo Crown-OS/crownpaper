@@ -1,6 +1,6 @@
 //! crownpaper — the CrownOS GPU wallpaper daemon.
 //!
-//! `crownpaper daemon` shows a still or video wallpaper on every output and
+//! `crownpaper` (or `crownpaper daemon`) shows a still or video wallpaper on every output and
 //! animates changes with a blur→focus transition. The other subcommands are
 //! thin clients for the daemon's `crownpaper` service on the CrownOS IPC bus.
 
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -24,24 +24,30 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 #[command(
     name = "crownpaper",
     version,
-    about = "Image and video wallpaper daemon for Wayland"
+    about = "Image and video wallpaper daemon for Wayland",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    daemon: DaemonArgs,
+}
+
+#[derive(Args)]
+struct DaemonArgs {
+    /// Wallpaper to show at startup [default: `wallpaper` from appearance.ron]
+    #[arg(short, long)]
+    image: Option<PathBuf>,
+    /// Default transition duration in seconds
+    #[arg(short, long, default_value_t = daemon::DEFAULT_TRANSITION_SECS)]
+    duration: f32,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the wallpaper daemon
-    Daemon {
-        /// Wallpaper to show at startup [default: `wallpaper` from appearance.ron]
-        #[arg(short, long)]
-        image: Option<PathBuf>,
-        /// Default transition duration in seconds
-        #[arg(short, long, default_value_t = daemon::DEFAULT_TRANSITION_SECS)]
-        duration: f32,
-    },
+    /// Run the wallpaper daemon (the default without a subcommand)
+    Daemon(DaemonArgs),
     /// Transition to a new wallpaper (image or video)
     Set {
         path: PathBuf,
@@ -76,8 +82,10 @@ fn main() -> Result<()> {
     .format_timestamp_millis()
     .init();
 
-    match Cli::parse().cmd {
-        Cmd::Daemon { image, duration } => daemon::run(image, duration),
+    let cli = Cli::parse();
+    let cmd = cli.cmd.unwrap_or(Cmd::Daemon(cli.daemon));
+    match cmd {
+        Cmd::Daemon(DaemonArgs { image, duration }) => daemon::run(image, duration),
         Cmd::Set { path, duration } => {
             let path = canonicalize(&path)?;
             let mut client = connect()?;

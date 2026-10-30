@@ -27,10 +27,10 @@ Both binaries must be installed side by side.
 
 ## Usage
 
-Start the daemon, optionally with a wallpaper and a default transition length:
+Running `crownpaper` without a subcommand starts the daemon (`crownpaper daemon` does the same), optionally with a wallpaper and a default transition length:
 
 ```sh
-crownpaper daemon [--image <path>] [--duration <seconds>]
+crownpaper [--image <path>] [--duration <seconds>]
 ```
 
 Without `--image` it uses `wallpaper` from `.config/crownos/appearance.ron`.
