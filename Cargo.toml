@@ -74,7 +74,7 @@ crownos-config = { path = "../crownos-config", default-features = false, optiona
 image = { version = "0.25", default-features = false, features = ["png", "webp", "bmp"], optional = true }
 turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config"], optional = true }
 fast_image_resize = { version = "6", optional = true }
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
+ffmpeg-next = { version = "9.1.0", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 rustix = { version = "1", default-features = false, features = ["std", "fs", "mm", "net", "event"], optional = true }
 postcard = { version = "1", default-features = false, features = ["use-std"], optional = true }
 libc = { version = "0.2", optional = true }
